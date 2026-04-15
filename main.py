@@ -1,5 +1,6 @@
 import os
 import re
+import threading
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -41,17 +42,9 @@ if not os.path.exists(DB_FAISS_PATH):
         "Ensure api_server/vectorstore/db_faiss is present in deployment."
     )
 
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-db = FAISS.load_local(DB_FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
-retriever = db.as_retriever(search_kwargs={'k': 3})
-
-llm = HuggingFaceEndpoint(
-    repo_id="HuggingFaceH4/zephyr-7b-beta", 
-    temperature=0.3,
-    max_new_tokens=512,
-    huggingfacehub_api_token=MY_HF_TOKEN
-)
-chat_model = ChatHuggingFace(llm=llm)
+rag_chain = None
+chat_model = None
+_chain_lock = threading.Lock()
 
 system_prompt = (
     "You are Lexi Voice, a professional Indian Law AI assistant. "
@@ -73,8 +66,29 @@ prompt = ChatPromptTemplate.from_messages([
     ("human", "{input}"),
 ])
 
-combine_docs_chain = create_stuff_documents_chain(chat_model, prompt)
-rag_chain = create_retrieval_chain(retriever, combine_docs_chain)
+def ensure_chain_initialized() -> None:
+    """Lazy-load heavy AI dependencies so server binds port quickly on Render."""
+    global rag_chain, chat_model
+    if rag_chain is not None and chat_model is not None:
+        return
+
+    with _chain_lock:
+        if rag_chain is not None and chat_model is not None:
+            return
+
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        db = FAISS.load_local(DB_FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
+        retriever = db.as_retriever(search_kwargs={"k": 3})
+
+        llm = HuggingFaceEndpoint(
+            repo_id="HuggingFaceH4/zephyr-7b-beta",
+            temperature=0.3,
+            max_new_tokens=512,
+            huggingfacehub_api_token=MY_HF_TOKEN,
+        )
+        chat_model = ChatHuggingFace(llm=llm)
+        combine_docs_chain = create_stuff_documents_chain(chat_model, prompt)
+        rag_chain = create_retrieval_chain(retriever, combine_docs_chain)
 
 class Query(BaseModel):
     text: str
@@ -261,6 +275,7 @@ def is_off_topic_for_reference(user_text: str, answer_text: str) -> bool:
 
 def regenerate_focused_answer(user_text: str) -> str:
     """Fallback generation without retrieval when RAG drifts off-topic."""
+    ensure_chain_initialized()
     focused_prompt = (
         "You are an Indian legal assistant. Answer ONLY this user query and stay strictly on topic. "
         "Do not add unrelated scenarios, people, or examples. "
@@ -289,6 +304,7 @@ async def chat_endpoint(query: Query):
         if is_clearly_non_legal(user_text):
             return {"answer": "I am trained on legal data and can help only with legal questions. Please ask a legal query."}
 
+        ensure_chain_initialized()
         guarded_input = build_guarded_query(user_text)
         response = rag_chain.invoke({"input": guarded_input})
         answer_text = clean_model_answer(response["answer"])
@@ -303,6 +319,11 @@ async def chat_endpoint(query: Query):
         return {"answer": answer_text}
     except Exception as e:
         return {"answer": f"Error: {str(e)}"}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 
 
